@@ -26,6 +26,11 @@ if [ ! -d "$SRC/captdriver/.git" ]; then
 fi
 git -C "$SRC/captdriver" fetch --depth 1 origin "$CAPT_COMMIT"
 git -C "$SRC/captdriver" checkout --detach "$CAPT_COMMIT"
+git -C "$SRC/captdriver" reset --hard "$CAPT_COMMIT"
+for patch in "$ROOT"/patches/*.patch; do
+  [ -f "$patch" ] || continue
+  patch -d "$SRC/captdriver" -p1 --forward --batch < "$patch"
+done
 
 echo "Building rastertocapt from captdriver $CAPT_COMMIT"
 (

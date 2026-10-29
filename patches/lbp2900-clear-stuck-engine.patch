@@ -1,0 +1,213 @@
+diff --git a/src/capt-command.c b/src/capt-command.c
+index 64bc90e..5eed6f3 100644
+--- a/src/capt-command.c
++++ b/src/capt-command.c
+@@ -91,18 +91,36 @@ static void capt_send_buf(void)
+ 
+ static void capt_recv_buf(size_t offset, size_t expected)
+ {
+-	ssize_t size;
++	size_t got = 0;
+ 	if (offset + expected > sizeof(capt_iobuf)) {
+ 		fprintf(stderr, "ALERT: bug in CAPT driver, input buffer overflow\n");
+ 		exit(1);
+ 	}
+ 	fprintf(stderr, "DEBUG: CAPT: waiting for %u bytes\n", (unsigned) expected);
+-	size = cupsBackChannelRead((char *) capt_iobuf + offset, expected, 15.0);
+-	if (size < 0) {
+-		fprintf(stderr, "ERROR: CAPT: no reply from printer\n");
+-		exit(1);
++	while (got < expected) {
++		ssize_t size = cupsBackChannelRead((char *) capt_iobuf + offset + got,
++			expected - got, 15.0);
++		if (size < 0) {
++			fprintf(stderr, "ERROR: CAPT: no reply from printer\n");
++			exit(1);
++		}
++		if (size == 0) {
++			fprintf(stderr, "ERROR: CAPT: short reply from printer (%u of %u bytes)\n",
++				(unsigned) got, (unsigned) expected);
++			exit(1);
++		}
++		got += (size_t) size;
+ 	}
+-	capt_iosize = offset + size;
++	capt_iosize = offset + got;
++}
++
++void capt_soft_reset(void)
++{
++	char buf[16];
++	int len = (int) sizeof(buf);
++	cups_sc_status_t status = cupsSideChannelDoRequest(CUPS_SC_CMD_SOFT_RESET,
++		buf, &len, 5.0);
++	fprintf(stderr, "DEBUG: CAPT: USB soft reset status %d\n", (int) status);
+ }
+ 
+ const char *capt_identify(void)
+diff --git a/src/capt-command.h b/src/capt-command.h
+index 9886db7..b8771ea 100644
+--- a/src/capt-command.h
++++ b/src/capt-command.h
+@@ -67,6 +67,7 @@ const char *capt_identify(void);
+ 
+ void capt_send(uint16_t cmd, const void *data, size_t size);
+ void capt_sendrecv(uint16_t cmd, const void *buf, size_t size, void *reply, size_t *reply_size);
++void capt_soft_reset(void);
+ 
+ void capt_multi_begin(uint16_t cmd);
+ void capt_multi_add(uint16_t cmd, const void *data, size_t size);
+diff --git a/src/prn_lbp2900.c b/src/prn_lbp2900.c
+index a91cc26..a2a506b 100644
+--- a/src/prn_lbp2900.c
++++ b/src/prn_lbp2900.c
+@@ -204,45 +204,108 @@ static void send_job_start(uint8_t fg)
+  * sequence (GoOffline → DiscardData → ClearMisPrint → ClearError → GoOnline)
+  * and retry once.  Returns the job ID extracted from buf[2:3].
+  */
++/*
++ * ReserveUnit's own reply byte is the busy/error flag. GetExtendedStatus can
++ * still say the printer is free (0x01) while ReserveUnit returns 0x8c, so the
++ * decision to clear has to use the ReserveUnit reply, not the status word.
++ * 0x8c is the engine holding a unit from a job whose USB session already died.
++ */
++static void capt_release_stuck_unit(uint16_t job_id)
++{
++	const struct capt_status_s *status = capt_get_xstatus_only();
++	uint8_t jbuf[2];
++
++	fprintf(stderr, "DEBUG: CAPT: engine status=0x%04x pap=0x%02x eng=0x%04x\n",
++		status->status[0], status->xstat_pap, status->xstat_eng);
++	if (status->xstat_pap == 0x00) {
++		fprintf(stderr, "STATE: +media-empty\n");
++		fprintf(stderr, "ERROR: CAPT: the printer reports no paper\n");
++	}
++
++	if (!FLAG(status, CAPT_FL_OFFLINE)) {
++		capt_sendrecv(CAPT_GO_OFFLINE, lbp3000_job_init,
++			ARRAY_SIZE(lbp3000_job_init), NULL, 0);
++		for (int i = 0; i < 20; i++) {
++			status = capt_get_xstatus_only();
++			if (FLAG(status, CAPT_FL_OFFLINE))
++				break;
++			usleep(100000);
++		}
++	}
++
++	jbuf[0] = LO(job_id);
++	jbuf[1] = HI(job_id);
++	fprintf(stderr, "DEBUG: CAPT: ReleaseUnit job %u\n", job_id);
++	capt_sendrecv(CAPT_RELEASE_UNIT, jbuf, 2, NULL, 0);
++	if (job_id != 0) {
++		jbuf[0] = 0;
++		jbuf[1] = 0;
++		capt_sendrecv(CAPT_RELEASE_UNIT, jbuf, 2, NULL, 0);
++	}
++	capt_sendrecv(CAPT_DISCARD_DATA, NULL, 0, NULL, 0);
++	capt_sendrecv(CAPT_CLEAR_MIS_PRINT, NULL, 0, NULL, 0);
++	capt_sendrecv(CAPT_CLEAR_ERROR, NULL, 0, NULL, 0);
++	capt_sendrecv(CAPT_GO_ONLINE, magicbuf_linux_online,
++		ARRAY_SIZE(magicbuf_linux_online), NULL, 0);
++	usleep(300000);
++}
++
+ static uint16_t capt_reserve_unit(struct printer_state_s *state)
+ {
+ 	uint8_t buf[8];
+-	size_t size = sizeof(buf);
++	size_t size;
++	int attempt;
++	int cleared = 0;
++	int online_tries = 0;
+ 
+-	capt_sendrecv(CAPT_RESERVE_UNIT, magicbuf_0, ARRAY_SIZE(magicbuf_0), buf, &size);
+-
+-	if (size >= 1 && (buf[0] & 0x80)) {
+-		fprintf(stderr, "DEBUG: CAPT: ReserveUnit error flag 0x%02x — clearing and retrying\n",
+-			buf[0]);
++	(void) state;
+ 
+-		/* Go offline first if not already offline */
+-		const struct capt_status_s *status = lbp2900_get_status(state->ops);
+-		if (!FLAG(status, CAPT_FL_OFFLINE)) {
+-			capt_sendrecv(CAPT_GO_OFFLINE, lbp3000_job_init, ARRAY_SIZE(lbp3000_job_init), NULL, 0);
+-			for (int i = 0; i < 50; i++) {
+-				status = lbp2900_get_status(state->ops);
+-				if (FLAG(status, CAPT_FL_OFFLINE))
+-					break;
+-				usleep(100000);
+-			}
+-		}
+-		capt_sendrecv(CAPT_DISCARD_DATA, NULL, 0, NULL, 0);
+-		capt_sendrecv(CAPT_CLEAR_MIS_PRINT, NULL, 0, NULL, 0);
+-		capt_sendrecv(CAPT_CLEAR_ERROR, NULL, 0, NULL, 0);
+-		capt_sendrecv(CAPT_GO_ONLINE, magicbuf_linux_online, ARRAY_SIZE(magicbuf_linux_online), NULL, 0);
+-		lbp2900_wait_ready(state->ops);
++	for (attempt = 0; attempt < 40; attempt++) {
++		/* Canon Linux sends GetExtendedStatus twice immediately before ReserveUnit. */
++		capt_get_xstatus_only();
++		capt_get_xstatus_only();
+ 
+-		/* Retry */
+ 		size = sizeof(buf);
++		memset(buf, 0, sizeof(buf));
+ 		capt_sendrecv(CAPT_RESERVE_UNIT, magicbuf_0, ARRAY_SIZE(magicbuf_0), buf, &size);
+-		if (size >= 1 && (buf[0] & 0x80)) {
+-			fprintf(stderr, "ERROR: CAPT: ReserveUnit failed (0x%02x) after error recovery — aborting\n",
+-				buf[0]);
+-			exit(1);
++		fprintf(stderr, "DEBUG: CAPT: ReserveUnit reply %02x %02x %02x %02x (packet %u bytes)\n",
++			buf[0], buf[1], buf[2], buf[3], (unsigned) size);
++		if ((buf[0] & CAPT_FL_ERROR_BIT) == 0)
++			return (size >= 4) ? WORD(buf[2], buf[3]) : 0;
++
++		/* 0x02 is set while the fuser is still warming after power-on.
++		 * Clearing or resetting here wedges a printer that is about to be ready. */
++		if (buf[0] & CAPT_FL_NOTREADY_BIT) {
++			fprintf(stderr, "DEBUG: CAPT: printer is still warming up (0x%02x)\n", buf[0]);
++			usleep(500000);
++			continue;
++		}
++
++		/* Offline after power-on. Bring it online. Do not go offline or reset USB. */
++		if (buf[0] & CAPT_FL_OFFLINE_BIT) {
++			if (online_tries++ >= 6)
++				break;
++			fprintf(stderr, "DEBUG: CAPT: printer is offline (0x%02x), sending GoOnline\n", buf[0]);
++			capt_sendrecv(CAPT_GO_ONLINE, magicbuf_linux_online,
++				ARRAY_SIZE(magicbuf_linux_online), NULL, 0);
++			usleep(500000);
++			continue;
++		}
++
++		/* 0x8c: error + image buffer full + command busy. One release, then stop. */
++		if ((buf[0] & CAPT_FL_IM_DATA_BUSY_BIT) && !cleared) {
++			fprintf(stderr, "DEBUG: CAPT: ReserveUnit error 0x%02x, releasing unit\n", buf[0]);
++			capt_release_stuck_unit(WORD(buf[2], buf[3]));
++			cleared = 1;
++			continue;
+ 		}
++
++		break;
+ 	}
+ 
+-	return (size >= 4) ? WORD(buf[2], buf[3]) : 0;
++	fprintf(stderr, "ERROR: CAPT: the printer is still busy with a failed job (status 0x%02x). Turn the printer off, wait ten seconds, turn it on, and print again.\n",
++		buf[0]);
++	exit(1);
+ }
+ 
+ static void lbp2900_job_prologue(struct printer_state_s *state)
+@@ -914,8 +977,10 @@ static struct lbp2900_ops_s lbp2900_ops = {
+ 		.gpio_blink = lbp2900_gpio_blink,
+ 		.gpio_blink_size = ARRAY_SIZE(lbp2900_gpio_blink)
+ 	},
+-	.get_status = capt_get_xstatus,
+-	.wait_ready = capt_wait_ready,
++	/* Always read extended status. Conditional basic-status polling never
++	 * refreshes the page counters on this model. */
++	.get_status = capt_get_xstatus_only,
++	.wait_ready = capt_wait_xready_only,
+ };
+ register_printer("LBP2900", lbp2900_ops.ops, WORKS);
+ 
