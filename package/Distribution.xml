@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Canon LBP2900</title>
+    <welcome file="welcome.txt" mime-type="text/plain"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+    <domains enable_localSystem="true"/>
+    <choices-outline>
+        <line choice="driver"/>
+    </choices-outline>
+    <choice id="driver" title="Canon LBP2900" description="CAPT driver for the Canon LBP2900">
+        <pkg-ref id="org.capt.lbp2900"/>
+    </choice>
+    <pkg-ref id="org.capt.lbp2900" version="1.0.0" onConclusion="none">CanonLBP2900-component.pkg</pkg-ref>
+</installer-gui-script>

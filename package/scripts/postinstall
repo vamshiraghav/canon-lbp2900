@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+SUPPORT="/Library/Application Support/Canon LBP2900"
+PLIST="/Library/LaunchDaemons/org.capt.lbp2900.heal.plist"
+
+/bin/sh "$SUPPORT/setup-queue.sh"
+
+launchctl bootout system "$PLIST" 2>/dev/null || true
+launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl load -w "$PLIST"
+
+exit 0

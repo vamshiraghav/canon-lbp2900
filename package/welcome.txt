@@ -1,0 +1,5 @@
+This installs a CUPS driver for the Canon LBP2900 laser printer.
+
+Plug the printer into USB and turn it on before you continue. The installer adds a printer named Canon LBP2900 and does not change any other printer or the system default.
+
+The driver stays installed after a restart. You can run this package again later to reinstall it.

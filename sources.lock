@@ -1,0 +1,5 @@
+CAPT_REPOSITORY=https://github.com/ValdikSS/captdriver.git
+CAPT_COMMIT=892f320c019974a5b737e000fcc2c8582264a131
+CUPS_REPOSITORY=https://github.com/OpenPrinting/cups.git
+CUPS_TAG=v2.4.17
+CUPS_COMMIT=4bd119bbec57885993ab583c79ee5c70be77a7c2
